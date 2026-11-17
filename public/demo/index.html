@@ -1,0 +1,430 @@
+<!doctype html>
+<!--
+  Asset Miner — local demo IDE fixture.
+
+  A self-contained fake development environment used to develop and test the
+  extension without depending on any external platform. It intentionally mimics
+  common editor DOM structures (CodeMirror-6-style classes: .cm-editor,
+  .cm-scroller, .cm-content, .cm-line, .cm-gutters, .cm-gutterElement) with
+  true virtualization (only the visible line window is rendered).
+
+  Asset Miner integration points (all standard DOM / CustomEvent):
+    [data-asset-miner-demo]          — fixture root marker
+    [data-am-type="folder"]          — tree folder row; [data-am-path] = rel path
+    [data-am-type="file"]            — tree file row; [data-am-path] = rel path
+    click                            — activates a file / expands a folder
+    CustomEvent "am:document"        — authorized full-document export event
+                                       (detail: { path, rev, reason }) — simulates
+                                       an official export interface on a platform
+    button #am-edit                  — silently mutates some lines of the active
+                                       file (tests conflict detection)
+    button #am-resync                — dispatches am:document for the active file
+                                       (tests authoritative revision supersede)
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Demo IDE — Asset Miner fixture</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font: 13px/1.5 "Segoe UI", system-ui, sans-serif;
+      background: #0d1117; color: #d7dde4; height: 100vh; display: flex; flex-direction: column;
+    }
+    header {
+      display: flex; gap: 12px; align-items: center; padding: 8px 14px;
+      background: #161b22; border-bottom: 1px solid #2a3138;
+    }
+    header h1 { font-size: 13px; margin: 0; font-weight: 600; }
+    header .spacer { flex: 1; }
+    button {
+      font: inherit; background: #21262d; color: #d7dde4; border: 1px solid #3a424b;
+      border-radius: 6px; padding: 4px 10px; cursor: pointer;
+    }
+    button:hover { background: #2a3138; }
+    #stage { flex: 1; display: flex; min-height: 0; }
+    /* --- file tree --- */
+    #tree {
+      width: 260px; overflow: auto; padding: 8px 4px; background: #10151b;
+      border-right: 1px solid #2a3138; user-select: none;
+    }
+    #tree ul { list-style: none; margin: 0; padding: 0; }
+    #tree li { padding-left: 14px; }
+    #tree .row {
+      display: flex; gap: 6px; align-items: center; padding: 2px 8px; border-radius: 4px;
+      cursor: pointer; white-space: nowrap;
+    }
+    #tree .row:hover { background: #1b2129; }
+    #tree .row.active { background: #084d8a; }
+    #tree .twist { width: 12px; color: #7b8694; font-size: 10px; }
+    #tree .icon { width: 14px; text-align: center; }
+    #tree .name { overflow: hidden; text-overflow: ellipsis; }
+    #tree ul.hidden { display: none; }
+    /* --- editor (CodeMirror-6-like structure) --- */
+    #editor-pane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    #active-tab {
+      padding: 6px 14px; background: #161b22; border-bottom: 1px solid #2a3138;
+      font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: #9fb0c0;
+    }
+    #active-tab b { color: #e6edf3; font-weight: 600; }
+    .cm-editor { flex: 1; display: flex; flex-flow: column; min-height: 0; position: relative; }
+    .cm-scroller { flex: 1; overflow: auto; display: flex; align-items: flex-start; }
+    .cm-gutters {
+      position: sticky; left: 0; flex: none; background: #10151b; color: #556270;
+      border-right: 1px solid #2a3138; min-width: 52px; text-align: right;
+      font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 21px;
+      user-select: none; z-index: 1;
+    }
+    .cm-gutterElement { padding: 0 10px 0 14px; height: 21px; }
+    .cm-gutterElement.spacer-top { height: auto; padding-bottom: 0; }
+    .cm-content {
+      flex: 1; padding: 0; font-family: ui-monospace, Consolas, monospace;
+      font-size: 12px; line-height: 21px; white-space: pre; outline: none; min-width: max-content;
+    }
+    .cm-line { padding: 0 12px; min-height: 21px; }
+    .cm-line .kw { color: #ff7b72; }
+    .cm-line .str { color: #a5d6ff; }
+    .cm-line .cmn { color: #8b949e; }
+    #status {
+      padding: 4px 14px; background: #161b22; border-top: 1px solid #2a3138;
+      font-size: 11px; color: #7b8694;
+    }
+  </style>
+</head>
+<body data-asset-miner-demo="1">
+  <header>
+    <h1>my-project <span style="color:#7b8694">(demo IDE fixture)</span></h1>
+    <span class="spacer"></span>
+    <button id="am-edit" title="Silently change some lines of the active file (simulates the platform editing source underneath you)">Simulate external edit</button>
+    <button id="am-resync" title="Emit an authorized full-document export event for the active file">Authorized re-sync (full document)</button>
+  </header>
+  <div id="stage">
+    <nav id="tree" aria-label="Project files"></nav>
+    <div id="editor-pane">
+      <div id="active-tab">no file open</div>
+      <div class="cm-editor" id="cm-editor"><div class="cm-scroller" id="cm-scroller"></div></div>
+      <div id="status">ready</div>
+    </div>
+  </div>
+
+  <script>
+  (() => {
+    'use strict';
+    // ------------------------------------------------------------------
+    // Deterministic project definition. File bodies are generated from a
+    // seeded PRNG so every session produces byte-identical content, which is
+    // what makes duplicate/conflict assertions reliable.
+    // ------------------------------------------------------------------
+    const FILE_TREE = [
+      { path: 'public/images/logo.svg', lines: 12, kind: 'svg' },
+      { path: 'public/images/banner.png', lines: 1, kind: 'bin' },
+      { path: 'public/icons', folder: true },
+      { path: 'public/favicon.ico', lines: 1, kind: 'bin' },
+      { path: 'src/components/Header.tsx', lines: 82, kind: 'tsx' },
+      { path: 'src/components/Footer.tsx', lines: 64, kind: 'tsx' },
+      { path: 'src/components/Sidebar.tsx', lines: 118, kind: 'tsx' },
+      { path: 'src/pages/Home.tsx', lines: 723, kind: 'tsx' },
+      { path: 'src/pages/About.tsx', lines: 205, kind: 'tsx' },
+      { path: 'src/pages/Dashboard.tsx', lines: 1500, kind: 'tsx' },
+      { path: 'src/assets', folder: true },
+      { path: 'src/styles/global.css', lines: 240, kind: 'css' },
+      { path: 'src/styles/theme.css', lines: 96, kind: 'css' },
+      { path: 'package.json', lines: 34, kind: 'json' },
+      { path: 'tsconfig.json', lines: 22, kind: 'json' },
+      { path: 'README.md', lines: 40, kind: 'md' },
+    ];
+    const EMPTY_FOLDERS = new Set(['public/icons', 'src/assets']);
+
+    function mulberry32(seed) {
+      let a = seed >>> 0;
+      return () => {
+        a |= 0; a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    function seedFor(path) {
+      let h = 2166136261;
+      for (let i = 0; i < path.length; i++) { h ^= path.charCodeAt(i); h = Math.imul(h, 16777619); }
+      return h >>> 0;
+    }
+    const TOKENS = ['panel', 'header', 'grid', 'token', 'route', 'state', 'cache', 'theme',
+      'button', 'modal', 'fetch', 'queue', 'layer', 'badge', 'stack', 'wire'];
+
+    function lineFor(path, kind, n, total, rand, rev) {
+      // External edit simulation: certain lines change with the revision counter,
+      // everything else is stable. Conflict checks rely on this determinism.
+      const edited = rev > 0 && (n === 3 || n === Math.min(total, 10 + rev * 7) || n % 97 === 0);
+      if (edited) return `// [rev ${rev}] externally edited at line ${n}`;
+      if (kind === 'tsx') {
+        if (n === 1) return `import { useMemo, useState } from 'react';`;
+        if (n === 2) return `import { ${TOKENS[Math.floor(rand() * 16)]} } from '../lib/core';`;
+        if (n === total) return `export default memo(Module_${n});`;
+        const r = rand();
+        if (r < 0.12) return `const ${TOKENS[Math.floor(rand() * 16)]}_${n} = ${Math.floor(rand() * 100000)};`;
+        if (r < 0.3) return `  const [state${n % 40}, setState${n % 40}] = useState(null);`;
+        if (r < 0.5) return `  function handler${n}(event) { event.preventDefault(); /* ${path} */ }`;
+        if (r < 0.7) return `      <div className="row row-${n % 12}" data-line="${n}">`;
+        if (r < 0.85) return `        <span>{value_${n % 33}}</span>`;
+        return `  // section ${n} of ${total} — deterministic fixture content`;
+      }
+      if (kind === 'css') {
+        if (n === 1) return `/* ${path} — generated fixture stylesheet */`;
+        const r = rand();
+        if (r < 0.2) return `.component-${n % 18} {`;
+        if (r < 0.3) return `}`;
+        if (r < 0.6) return `  padding: ${n % 24}px ${n % 16}px;`;
+        if (r < 0.8) return `  color: hsl(${n % 360}, 40%, ${30 + (n % 40)}%);`;
+        return `  /* rule ${n} */`;
+      }
+      if (kind === 'json') {
+        if (n === 1) return '{';
+        if (n === total) return '}';
+        const r = rand();
+        if (r < 0.4) return `  "key_${n}": "value-${Math.floor(rand() * 9999)}",`;
+        if (r < 0.6) return `  "count_${n}": ${Math.floor(rand() * 500)},`;
+        return `  "flag_${n}": ${rand() > 0.5 ? 'true' : 'false'}${n === total - 1 ? '' : ','}`;
+      }
+      if (kind === 'md') {
+        if (n === 1) return `# ${path.split('/').pop()}`;
+        return `Fixture documentation paragraph ${n}. ${'lorem '.repeat(n % 7).trim()}.`;
+      }
+      if (kind === 'svg') {
+        if (n === 1) return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">';
+        if (n === 12) return '</svg>';
+        return `  <path d="M${n} ${n + 1} L${n + 4} ${n + 2}" stroke="#f6be42" />`;
+      }
+      return `binary asset (${path}) — ${Math.floor(rand() * 90000) + 10000} bytes`;
+    }
+
+    function makeContent(path, lines, kind, rev) {
+      const rand = mulberry32(seedFor(path));
+      const out = [];
+      for (let n = 1; n <= lines; n++) out.push(lineFor(path, kind, n, lines, rand, rev));
+      return out;
+    }
+
+    const fileIndex = new Map(); // path -> {path, lines, kind, rev, content[]}
+    for (const f of FILE_TREE) {
+      if (f.folder) continue;
+      fileIndex.set(f.path, { path: f.path, lines: f.lines, kind: f.kind, rev: 0, content: makeContent(f.path, f.lines, f.kind, 0) });
+    }
+    let active = null;
+
+    // ------------------------------------------------------------------ tree
+    const treeEl = document.getElementById('tree');
+
+    // Build a nested directory model: node = { path, folders: Map, files: [] }
+    function buildModel() {
+      const root = { path: '', folders: new Map(), files: [] };
+      for (const entry of FILE_TREE) {
+        const parts = entry.folder ? entry.path.split('/') : entry.path.split('/').slice(0, -1);
+        let node = root;
+        for (const seg of parts) {
+          if (!node.folders.has(seg)) node.folders.set(seg, { path: node.path ? `${node.path}/${seg}` : seg, folders: new Map(), files: [] });
+          node = node.folders.get(seg);
+        }
+        if (entry.folder) { /* folder node created above */ } else {
+          node.files.push(entry.path);
+        }
+      }
+      return root;
+    }
+
+    function sortNames(names) {
+      return [...names].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    }
+
+    function rowEl(path, type, icon, name) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.dataset.amType = type;
+      row.dataset.amPath = path;
+      if (type === 'folder') {
+        row.setAttribute('role', 'treeitem');
+        row.setAttribute('aria-expanded', 'false');
+        row.appendChild(Object.assign(document.createElement('span'), { className: 'twist', textContent: '▶' }));
+      } else {
+        row.setAttribute('role', 'treeitem');
+        row.appendChild(Object.assign(document.createElement('span'), { className: 'twist', textContent: '' }));
+      }
+      row.appendChild(Object.assign(document.createElement('span'), { className: 'icon', textContent: icon }));
+      row.appendChild(Object.assign(document.createElement('span'), { className: 'name', textContent: name }));
+      return row;
+    }
+
+    function renderFolder(node, empty) {
+      const li = document.createElement('li');
+      const label = empty ? `${node.path.split('/').pop()}  (empty)` : node.path.split('/').pop();
+      li.appendChild(rowEl(node.path, 'folder', '📁', label));
+      const childUl = document.createElement('ul');
+      childUl.className = 'hidden';
+      for (const subName of sortNames(node.folders.keys())) {
+        const sub = node.folders.get(subName);
+        childUl.appendChild(renderFolder(sub, sub.files.length === 0 && sub.folders.size === 0));
+      }
+      for (const fp of sortNames(node.files)) {
+        const fli = document.createElement('li');
+        fli.appendChild(rowEl(fp, 'file', '📄', fp.split('/').pop()));
+        childUl.appendChild(fli);
+      }
+      li.appendChild(childUl);
+      return li;
+    }
+
+    function buildTree() {
+      const root = buildModel();
+      const ul = document.createElement('ul');
+      ul.setAttribute('role', 'tree');
+      for (const subName of sortNames(root.folders.keys())) {
+        const sub = root.folders.get(subName);
+        ul.appendChild(renderFolder(sub, sub.files.length === 0 && sub.folders.size === 0));
+      }
+      for (const fp of sortNames(root.files)) {
+        const li = document.createElement('li');
+        li.appendChild(rowEl(fp, 'file', '📄', fp.split('/').pop()));
+        ul.appendChild(li);
+      }
+      treeEl.appendChild(ul);
+    }
+
+    // ---------------------------------------------------------------- editor
+    const scroller = document.getElementById('cm-scroller');
+    const gutters = document.createElement('div');
+    gutters.className = 'cm-gutters';
+    const lineNumbers = document.createElement('div');
+    lineNumbers.className = 'cm-gutter cm-lineNumbers';
+    gutters.appendChild(lineNumbers);
+    const content = document.createElement('div');
+    content.className = 'cm-content';
+    content.setAttribute('spellcheck', 'false');
+    scroller.append(gutters, content);
+
+    const LINE_H = 21;
+    const OVERSCAN = 6;
+    let raf = 0;
+
+    function render() {
+      const f = active;
+      lineNumbers.textContent = '';
+      content.textContent = '';
+      document.getElementById('active-tab').innerHTML = f
+        ? `active: <b>${f.path}</b> · ${f.lines} lines · rev ${f.rev}`
+        : 'no file open';
+      if (!f) { document.getElementById('status').textContent = 'open a file from the tree'; return; }
+      const viewportH = scroller.clientHeight || 480;
+      const visible = Math.max(8, Math.ceil(viewportH / LINE_H));
+      const first = Math.max(1, Math.floor(scroller.scrollTop / LINE_H) - OVERSCAN + 1);
+      const last = Math.min(f.lines, first + visible + OVERSCAN * 2 - 1);
+
+      // Top spacer gutter element (CM6 uses padded gutter elements for this).
+      if (first > 1) {
+        const g = document.createElement('div');
+        g.className = 'cm-gutterElement spacer-top';
+        g.style.paddingBottom = `${(first - 1) * LINE_H}px`;
+        lineNumbers.appendChild(g);
+      }
+      for (let n = first; n <= last; n++) {
+        const line = document.createElement('div');
+        line.className = 'cm-line';
+        if (n === first && first > 1) line.style.marginTop = `${(first - 1) * LINE_H}px`;
+        if (n === last && last < f.lines) line.style.marginBottom = `${(f.lines - last) * LINE_H}px`;
+        const text = f.content[n - 1] ?? '';
+        // Sprinkle syntax-ish spans so observers must walk text nodes.
+        const kw = text.match(/^(?:import|const|function|export|return)\b/);
+        if (kw) {
+          const s = document.createElement('span');
+          s.className = 'kw';
+          s.textContent = kw[0];
+          line.appendChild(s);
+          line.appendChild(document.createTextNode(text.slice(kw[0].length)));
+        } else if (text.trimStart().startsWith('//')) {
+          const s = document.createElement('span');
+          s.className = 'cmn';
+          s.textContent = text;
+          line.appendChild(s);
+        } else {
+          line.appendChild(document.createTextNode(text));
+        }
+        content.appendChild(line);
+
+        const g = document.createElement('div');
+        g.className = 'cm-gutterElement';
+        g.textContent = String(n);
+        lineNumbers.appendChild(g);
+      }
+      if (last < f.lines) {
+        const g = document.createElement('div');
+        g.className = 'cm-gutterElement spacer-top';
+        g.style.paddingBottom = `${(f.lines - last) * LINE_H}px`;
+        lineNumbers.appendChild(g);
+      }
+      document.getElementById('status').textContent =
+        `rendered lines ${first}–${last} of ${f.lines} (virtualized) · scrollTop ${Math.round(scroller.scrollTop)}`;
+    }
+    scroller.addEventListener('scroll', () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => { raf = 0; render(); });
+    });
+
+    function openFile(path) {
+      const f = fileIndex.get(path);
+      if (!f) return;
+      active = f;
+      scroller.scrollTop = 0;
+      for (const row of treeEl.querySelectorAll('.row')) row.classList.toggle('active', row.dataset.amPath === path);
+      render();
+    }
+
+    treeEl.addEventListener('click', (e) => {
+      const row = e.target.closest('.row');
+      if (!row) return;
+      const path = row.dataset.amPath;
+      if (row.dataset.amType === 'file') { openFile(path); return; }
+      const childUl = row.parentElement.querySelector(':scope > ul');
+      if (!childUl) return;
+      childUl.classList.toggle('hidden');
+      const twist = row.querySelector('.twist');
+      const expanded = !childUl.classList.contains('hidden');
+      twist.textContent = expanded ? '▼' : '▶';
+      row.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    });
+
+    // ------------------------------------------------------ control buttons
+    document.getElementById('am-edit').addEventListener('click', () => {
+      if (!active) return;
+      active.rev += 1;
+      active.content = makeContent(active.path, active.lines, active.kind, active.rev);
+      render();
+      document.getElementById('status').textContent =
+        `external edit applied to ${active.path} (rev ${active.rev}) — previously captured ranges now conflict`;
+    });
+    document.getElementById('am-resync').addEventListener('click', () => {
+      if (!active) return;
+      document.getElementById('cm-editor').dispatchEvent(new CustomEvent('am:document', {
+        bubbles: true,
+        detail: { path: active.path, rev: active.rev, reason: 'fixture-authorized-export' },
+      }));
+      document.getElementById('status').textContent =
+        `authorized full-document event emitted for ${active.path}`;
+    });
+
+    // A couple of page assets for the resource scanner (data URIs — no network).
+    const assetShelf = document.createElement('div');
+    assetShelf.hidden = true;
+    assetShelf.innerHTML =
+      '<img data-am-asset="banner.png" alt="" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" />' +
+      '<svg data-am-asset="logo.svg" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M3 18 L12 3 L21 18 Z" fill="#f6be42"/></svg>';
+    document.body.appendChild(assetShelf);
+
+    window.addEventListener('resize', render);
+    buildTree();
+    render();
+    window.__amFixture = { openFile, fileIndex, FILE_TREE };
+  })();
+  </script>
+</body>
+</html>
